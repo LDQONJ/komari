@@ -199,6 +199,13 @@ func (w *reportBatchWorker) enqueue(ctx context.Context, report v1.Report) error
 }
 
 func (w *reportBatchWorker) run() {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Errorf("metricstore", "panic in reportBatchWorker: %v", r)
+			go w.run()
+		}
+	}()
+
 	ticker := time.NewTicker(reportBatchInterval)
 	defer ticker.Stop()
 
@@ -303,17 +310,21 @@ func writePendingReports(ctx context.Context, pending *[]v1.Report) error {
 		return nil
 	}
 	batchSize := len(*pending)
+	if batchSize > reportBatchQueueSize {
+		batchSize = reportBatchQueueSize
+	}
 	for len(*pending) > 0 {
-		if batchSize > len(*pending) {
-			batchSize = len(*pending)
+		currentBatch := batchSize
+		if currentBatch > len(*pending) {
+			currentBatch = len(*pending)
 		}
 		writeCtx, cancel := context.WithTimeout(ctx, reportBatchWriteTimeout)
-		_, err := writeReportBatch(writeCtx, (*pending)[:batchSize])
+		_, err := writeReportBatch(writeCtx, (*pending)[:currentBatch])
 		cancel()
+		*pending = (*pending)[currentBatch:]
 		if err != nil {
 			return err
 		}
-		*pending = (*pending)[batchSize:]
 	}
 	return nil
 }
@@ -327,10 +338,10 @@ func writePendingPingRecords(ctx context.Context, pending *[]models.PingRecord) 
 		writeCtx, cancel := context.WithTimeout(ctx, reportBatchWriteTimeout)
 		err := writePingRecords(writeCtx, (*pending)[:batchSize])
 		cancel()
+		*pending = (*pending)[batchSize:]
 		if err != nil {
 			return err
 		}
-		*pending = (*pending)[batchSize:]
 	}
 	return nil
 }
@@ -377,10 +388,10 @@ func writeReportBatch(ctx context.Context, reports []v1.Report) ([]v1.Report, er
 			} else if ctx.Err() == nil {
 				logger.Errorf("metricstore", "failed to restore previous download counter for %s: %v", report.UUID, err)
 			}
+			values.initialized = true
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			values.initialized = true
 		}
 
 		if !values.timestamp.IsZero() && !report.UpdatedAt.After(values.timestamp) {

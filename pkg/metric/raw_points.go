@@ -194,8 +194,8 @@ func (s *Store) writeRawPointsAt(points []preparedMetricPoint, now time.Time) ma
 				if old.labelID != sample.labelID {
 					dirtyLabels[series] = struct{}{}
 				}
+				markRawRebuild(rebuild, point, point.labelsHash)
 			}
-			markRawRebuild(rebuild, point, point.labelsHash)
 			continue
 		}
 		index := sort.Search(len(series.samples), func(i int) bool {
@@ -295,6 +295,13 @@ func (s *Store) queryRawPointsBatch(ctx context.Context, query BatchQuery) (map[
 	if start < visibleCutoff {
 		start = visibleCutoff
 	}
+	if start > end {
+		result := make(map[string][]Point, len(query.MetricNames))
+		for _, metricName := range query.MetricNames {
+			result[metricName] = nil
+		}
+		return result, nil
+	}
 	metricNames := make(map[string]struct{}, len(query.MetricNames))
 	matched := make(map[string]*rawBatchPoints, len(query.MetricNames))
 	for _, metricName := range query.MetricNames {
@@ -327,6 +334,9 @@ func (s *Store) queryRawPointsBatch(ctx context.Context, query BatchQuery) (map[
 		labels := make(map[uint32]map[string]string)
 		directStart := sort.Search(len(series.samples), func(i int) bool { return series.samples[i].timestamp >= start })
 		directEnd := sort.Search(len(series.samples), func(i int) bool { return series.samples[i].timestamp > end })
+		if directStart > directEnd {
+			directStart = directEnd
+		}
 		additional := directEnd - directStart
 		if series.compressed.count > 0 && start <= series.compressed.firstStamp() && end >= series.compressed.lastStamp {
 			additional += series.compressed.count
@@ -349,12 +359,14 @@ func (s *Store) queryRawPointsBatch(ctx context.Context, query BatchQuery) (map[
 				appendRawQueryPoint(metricPoints, key, tags, labelMap, sample)
 			}
 		}
-		for _, sample := range series.samples[directStart:directEnd] {
-			labelMap, err := rawSampleLabels(series, labels, sample.labelID)
-			if err != nil {
-				return nil, err
+		if directStart < directEnd {
+			for _, sample := range series.samples[directStart:directEnd] {
+				labelMap, err := rawSampleLabels(series, labels, sample.labelID)
+				if err != nil {
+					return nil, err
+				}
+				appendRawQueryPoint(metricPoints, key, tags, labelMap, sample)
 			}
-			appendRawQueryPoint(metricPoints, key, tags, labelMap, sample)
 		}
 	}
 	result := make(map[string][]Point, len(matched))
@@ -723,13 +735,16 @@ func (s *Store) latestRollupBefore(ctx context.Context, metricName, entityID str
 		var timestamp int64
 		var rawTags, rawLabels any
 		err := s.reader().QueryRowContext(ctx, fmt.Sprintf(`SELECT r.last_val, r.last_ts_milli, s.tags, l.labels
-			FROM %s r JOIN %s s ON s.id = r.series_id JOIN %s l ON l.id = r.label_id
-			WHERE r.series_id IN (SELECT id FROM %s WHERE metric_name = %s AND entity_id = %s)
-			AND r.resolution_id IN (SELECT id FROM %s WHERE resolution_milli = %s)
+			FROM %s r
+			JOIN %s s ON s.id = r.series_id
+			JOIN %s l ON l.id = r.label_id
+			JOIN %s d ON d.id = r.resolution_id
+			WHERE s.metric_name = %s AND s.entity_id = %s
+			AND d.resolution_milli = %s
 			AND r.last_ts_milli <= %s
 			ORDER BY r.last_ts_milli DESC LIMIT 1`,
-			s.tables.rollups, s.tables.series, s.tables.labels, s.tables.series,
-			s.dialect.placeholder(1), s.dialect.placeholder(2), s.tables.resolutions,
+			s.tables.rollups, s.tables.series, s.tables.labels, s.tables.resolutions,
+			s.dialect.placeholder(1), s.dialect.placeholder(2),
 			s.dialect.placeholder(3), s.dialect.placeholder(4)),
 			metricName, entityID, tier.Interval.Milliseconds(), endMilli,
 		).Scan(&value, &timestamp, &rawTags, &rawLabels)

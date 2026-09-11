@@ -113,8 +113,6 @@ func (s *Store) rebuildHotRollupsLocked(keys map[hotRollupKey]struct{}, compress
 }
 
 func (s *Store) flushClosedHotRollups(ctx context.Context, now time.Time) (int, error) {
-	s.rollupViewMu.Lock()
-	defer s.rollupViewMu.Unlock()
 	return s.flushClosedHotRollupsUnderView(ctx, now)
 }
 

@@ -2,6 +2,7 @@ package tasks
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"time"
 
@@ -68,17 +69,57 @@ func EditPingTask(tasks []*models.PingTask) error {
 	db := dbcore.GetDBInstance()
 	for _, task := range tasks {
 		task.Clients = normalizePingClients(task.Clients)
+
+		var existing models.PingTask
+		hasExisting := false
+		if err := db.Where("id = ?", task.Id).First(&existing).Error; err == nil {
+			hasExisting = true
+		}
+
+		isReverse := task.IsReverse
+		reverseSource := task.ReverseSource
+		reverseTarget := task.ReverseTarget
+		port := task.Port
+		ipPref := task.IPPreference
+		target := task.Target
+
+		if hasExisting && existing.IsReverse {
+			isReverse = true
+			if reverseSource == "" {
+				reverseSource = existing.ReverseSource
+			}
+			if reverseTarget == "" {
+				reverseTarget = existing.ReverseTarget
+			}
+			if port <= 0 {
+				port = existing.Port
+			}
+			if ipPref == "" {
+				ipPref = existing.IPPreference
+			}
+			if task.Type == "tcp" && port > 0 {
+				target = fmt.Sprintf(":%d", port)
+			} else if task.Type == "icmp" {
+				target = "icmp"
+			}
+		}
+
 		// 使用 map 显式更新，避免 GORM struct Updates 跳过 false/0/空切片等零值。
 		updates := map[string]interface{}{
-			"name":        task.Name,
-			"clients":     task.Clients,
-			"all_clients": task.DefaultOn,
-			"type":        task.Type,
-			"target":      task.Target,
-			"interval":    task.Interval,
+			"name":           task.Name,
+			"clients":        task.Clients,
+			"all_clients":    task.DefaultOn,
+			"type":           task.Type,
+			"target":         target,
+			"interval":       task.Interval,
+			"is_reverse":     isReverse,
+			"reverse_source": reverseSource,
+			"reverse_target": reverseTarget,
+			"port":           port,
+			"ip_preference":  ipPref,
 		}
 		result := db.Model(&models.PingTask{}).Where("id = ?", task.Id).Updates(updates)
-		if result.RowsAffected == 0 {
+		if result.RowsAffected == 0 && !hasExisting {
 			return gorm.ErrRecordNotFound
 		}
 	}
@@ -169,10 +210,12 @@ func DeleteAllPingRecords() error {
 }
 
 func ReloadPingSchedule() error {
+	MigrateSplitReverseTasks()
 	pingTasks, err := GetAllPingTasks()
 	if err != nil {
 		return err
 	}
+	UpdatePingTaskCache(pingTasks)
 	return utils.ReloadPingSchedule(pingTasks)
 }
 

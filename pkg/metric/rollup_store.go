@@ -106,11 +106,18 @@ func (s *Store) replaceMinuteRollupsTx(ctx context.Context, metricName string, p
 		return nil
 	}
 	cache := newRollupDictionaryCache()
+	resolutionID, err := cache.resolutionID(ctx, s, tx, policy.Tiers[0].Interval)
+	if err != nil {
+		return err
+	}
 	keys := make([]rollupKey, 0, len(replacements))
 	for key := range replacements {
 		keys = append(keys, key)
 	}
 	sortRollupKeys(keys)
+	rowsToUpsert := make([]normalizedRollupRow, 0, len(keys))
+	nowMilli := timeMillis(time.Now())
+
 	for _, key := range keys {
 		bucket := replacements[key]
 		if bucket == nil || bucket.count == 0 {
@@ -119,7 +126,40 @@ func (s *Store) replaceMinuteRollupsTx(ctx context.Context, metricName string, p
 			}
 			continue
 		}
-		if err := s.upsertRollupWithDictionaryTx(ctx, metricName, policy.Tiers[0].Interval, key, bucket, cache, tx); err != nil {
+		seriesID, err := cache.seriesID(ctx, s, tx, metricName, key, bucket.tagsJSON)
+		if err != nil {
+			return err
+		}
+		labelID, err := cache.labelID(ctx, s, tx, key.labelsHash, bucket.labelsJSON)
+		if err != nil {
+			return err
+		}
+		rowsToUpsert = append(rowsToUpsert, normalizedRollupRow{
+			seriesID:       seriesID,
+			resolutionID:   resolutionID,
+			labelID:        labelID,
+			bucketMilli:    key.bucket,
+			count:          bucket.count,
+			sum:            bucket.sum,
+			sumSq:          bucket.sumSq,
+			min:            bucket.min,
+			max:            bucket.max,
+			firstVal:       bucket.firstVal,
+			firstTSMilli:   bucket.firstTS,
+			lastVal:        bucket.lastVal,
+			lastTSMilli:    bucket.lastTS,
+			digest:         bucket.encodedDigest(),
+			createdAtMilli: nowMilli,
+		})
+	}
+
+	const upsertBatchSize = 200
+	for i := 0; i < len(rowsToUpsert); i += upsertBatchSize {
+		end := i + upsertBatchSize
+		if end > len(rowsToUpsert) {
+			end = len(rowsToUpsert)
+		}
+		if err := s.upsertNormalizedRollupRowsTx(ctx, rowsToUpsert[i:end], tx); err != nil {
 			return err
 		}
 	}
@@ -206,21 +246,133 @@ func (s *Store) mergeRollupBucketsWithDictionaryTx(ctx context.Context, metricNa
 		keys = append(keys, key)
 	}
 	sortRollupKeys(keys)
+
+	resolutionID, err := cache.resolutionID(ctx, s, tx, interval)
+	if err != nil {
+		return 0, err
+	}
+
+	type resolvedKey struct {
+		seriesID    int64
+		labelID     int64
+		bucketMilli int64
+	}
+	resolvedMap := make(map[resolvedKey]*rollupBucket, len(keys))
+	seriesIDSet := make(map[int64]struct{})
+	var minBucket, maxBucket int64 = 1<<62, -1<<62
+
 	for _, key := range keys {
 		bucket := buckets[key]
 		key.bucket = normalizeBucketMillis(key.bucket)
-		existing, err := s.readRollupBucketTx(ctx, metricName, key, interval, tx)
+		if key.bucket < minBucket {
+			minBucket = key.bucket
+		}
+		if key.bucket > maxBucket {
+			maxBucket = key.bucket
+		}
+		seriesID, err := cache.seriesID(ctx, s, tx, metricName, key, bucket.tagsJSON)
 		if err != nil {
 			return 0, err
 		}
-		if existing != nil {
-			existing.mergeStored(bucket)
-			bucket = existing
+		labelID, err := cache.labelID(ctx, s, tx, key.labelsHash, bucket.labelsJSON)
+		if err != nil {
+			return 0, err
 		}
-		if err := s.upsertRollupWithDictionaryTx(ctx, metricName, interval, key, bucket, cache, tx); err != nil {
+		seriesIDSet[seriesID] = struct{}{}
+		rk := resolvedKey{seriesID: seriesID, labelID: labelID, bucketMilli: key.bucket}
+		resolvedMap[rk] = bucket
+	}
+
+	if len(seriesIDSet) > 0 && minBucket <= maxBucket {
+		seriesIDs := make([]int64, 0, len(seriesIDSet))
+		for sid := range seriesIDSet {
+			seriesIDs = append(seriesIDs, sid)
+		}
+		const seriesChunkSize = 50
+		for i := 0; i < len(seriesIDs); i += seriesChunkSize {
+			end := i + seriesChunkSize
+			if end > len(seriesIDs) {
+				end = len(seriesIDs)
+			}
+			chunk := seriesIDs[i:end]
+			placeholders := make([]string, len(chunk))
+			args := make([]any, 0, len(chunk)+3)
+			args = append(args, resolutionID, minBucket, maxBucket)
+			for j, sid := range chunk {
+				placeholders[j] = s.dialect.placeholder(j + 4)
+				args = append(args, sid)
+			}
+			query := fmt.Sprintf(`SELECT series_id, label_id, bucket_milli, count, sum, sum_sq, min_val, max_val, first_val, first_ts_milli, last_val, last_ts_milli, digest
+				FROM %s
+				WHERE resolution_id = %s AND bucket_milli >= %s AND bucket_milli <= %s AND series_id IN (%s)`,
+				s.tables.rollups,
+				s.dialect.placeholder(1), s.dialect.placeholder(2), s.dialect.placeholder(3),
+				joinSQL(placeholders),
+			)
+			rows, err := tx.QueryContext(ctx, query, args...)
+			if err != nil {
+				return 0, err
+			}
+			for rows.Next() {
+				var sid, lid, bMilli, count, firstTS, lastTS int64
+				var sum, sumSq, min, max, firstVal, lastVal float64
+				var digest []byte
+				if err := rows.Scan(&sid, &lid, &bMilli, &count, &sum, &sumSq, &min, &max, &firstVal, &firstTS, &lastVal, &lastTS, &digest); err != nil {
+					_ = rows.Close()
+					return 0, err
+				}
+				rk := resolvedKey{seriesID: sid, labelID: lid, bucketMilli: bMilli}
+				if incomingBucket, ok := resolvedMap[rk]; ok {
+					d, err := digestFromRollup(count, min, max, digest, s.cfg.RollupPolicy.compression())
+					if err == nil {
+						existingBucket := &rollupBucket{
+							count: count, sum: sum, sumSq: sumSq, min: min, max: max,
+							firstVal: firstVal, firstTS: firstTS, lastVal: lastVal, lastTS: lastTS,
+							digest: d, tagsHash: incomingBucket.tagsHash, tagsJSON: incomingBucket.tagsJSON,
+							labelsHash: incomingBucket.labelsHash, labelsJSON: incomingBucket.labelsJSON,
+						}
+						existingBucket.mergeStored(incomingBucket)
+						resolvedMap[rk] = existingBucket
+					}
+				}
+			}
+			_ = rows.Close()
+		}
+	}
+
+	nowMilli := timeMillis(time.Now())
+	rowsToUpsert := make([]normalizedRollupRow, 0, len(resolvedMap))
+	for rk, bucket := range resolvedMap {
+		rowsToUpsert = append(rowsToUpsert, normalizedRollupRow{
+			seriesID:       rk.seriesID,
+			resolutionID:   resolutionID,
+			labelID:        rk.labelID,
+			bucketMilli:    rk.bucketMilli,
+			count:          bucket.count,
+			sum:            bucket.sum,
+			sumSq:          bucket.sumSq,
+			min:            bucket.min,
+			max:            bucket.max,
+			firstVal:       bucket.firstVal,
+			firstTSMilli:   bucket.firstTS,
+			lastVal:        bucket.lastVal,
+			lastTSMilli:    bucket.lastTS,
+			digest:         bucket.encodedDigest(),
+			createdAtMilli: nowMilli,
+		})
+	}
+
+	const upsertBatchSize = 200
+	for i := 0; i < len(rowsToUpsert); i += upsertBatchSize {
+		end := i + upsertBatchSize
+		if end > len(rowsToUpsert) {
+			end = len(rowsToUpsert)
+		}
+		if err := s.upsertNormalizedRollupRowsTx(ctx, rowsToUpsert[i:end], tx); err != nil {
 			return 0, err
 		}
 	}
+
 	return len(keys), nil
 }
 

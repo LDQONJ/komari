@@ -254,6 +254,7 @@ func registerAdminRoutes(r *gin.Engine) {
 	{
 		pingTask.GET("/", jsonRpc.Bind("admin:getAllPingTasks"))
 		pingTask.POST("/add", jsonRpc.Bind("admin:addPingTask"))
+		pingTask.POST("/addReverse", jsonRpc.Bind("admin:addReversePingTask"))
 		pingTask.POST("/delete", jsonRpc.Bind("admin:deletePingTask"))
 		pingTask.POST("/edit", jsonRpc.Bind("admin:editPingTask"))
 		pingTask.POST("/order", jsonRpc.Bind("admin:orderPingTask"))

@@ -47,9 +47,21 @@ func ingestBasicInfo(uuid string, info map[string]interface{}, fallbackIP string
 
 // ingestPingResult 保存一条 ping 探测结果。
 func ingestPingResult(uuid string, taskID uint, value int) error {
+	clientUUID := uuid
+	realTaskID := taskID
+
+	if target, ok := tasks.LookupReverseWireTarget(taskID); ok {
+		realTaskID = target.TaskID
+		clientUUID = target.TargetUUID
+	} else if task, err := tasks.GetPingTaskByID(taskID); err == nil && task != nil {
+		if task.IsReverse && task.ReverseTarget != "" {
+			clientUUID = task.ReverseTarget
+		}
+	}
+
 	return tasks.SavePingRecord(models.PingRecord{
-		Client: uuid,
-		TaskId: taskID,
+		Client: clientUUID,
+		TaskId: realTaskID,
 		Value:  value,
 		Time:   time.Now().UTC(),
 	})

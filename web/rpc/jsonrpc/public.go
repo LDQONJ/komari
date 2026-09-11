@@ -211,24 +211,36 @@ func publicGetPublicPingTasks(_ context.Context, _ *rpc.JsonRpcRequest) (any, *r
 		return nil, rpc.MakeError(rpc.InternalError, err.Error(), nil)
 	}
 	type publicPingTask struct {
-		Id        uint     `json:"id"`
-		Weight    int      `json:"weight"`
-		Name      string   `json:"name"`
-		Clients   []string `json:"clients"`
-		DefaultOn bool     `json:"default_on"`
-		Type      string   `json:"type"`
-		Interval  int      `json:"interval"`
+		Id            uint     `json:"id"`
+		Weight        int      `json:"weight"`
+		Name          string   `json:"name"`
+		Clients       []string `json:"clients"`
+		DefaultOn     bool     `json:"default_on"`
+		Type          string   `json:"type"`
+		Interval      int      `json:"interval"`
+		IsReverse     bool     `json:"is_reverse,omitempty"`
+		ReverseSource string   `json:"reverse_source,omitempty"`
+		ReverseTarget string   `json:"reverse_target,omitempty"`
+		Port          int      `json:"port,omitempty"`
 	}
 	out := make([]publicPingTask, len(pingTasks))
 	for i, task := range pingTasks {
+		clientsList := task.Clients
+		if task.IsReverse && len(clientsList) == 0 && task.ReverseTarget != "" {
+			clientsList = []string{task.ReverseTarget}
+		}
 		out[i] = publicPingTask{
-			Id:        task.Id,
-			Weight:    task.Weight,
-			Name:      task.Name,
-			Clients:   task.Clients,
-			DefaultOn: task.DefaultOn,
-			Type:      task.Type,
-			Interval:  task.Interval,
+			Id:            task.Id,
+			Weight:        task.Weight,
+			Name:          task.Name,
+			Clients:       clientsList,
+			DefaultOn:     task.DefaultOn,
+			Type:          task.Type,
+			Interval:      task.Interval,
+			IsReverse:     task.IsReverse,
+			ReverseSource: task.ReverseSource,
+			ReverseTarget: task.ReverseTarget,
+			Port:          task.Port,
 		}
 	}
 	return out, nil

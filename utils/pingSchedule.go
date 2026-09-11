@@ -55,8 +55,53 @@ func (m *PingTaskManager) Reload(pingTasks []models.PingTask) error {
 	return nil
 }
 
+// WireTarget 描述反向探测受测目标的解析后信息
+type WireTarget struct {
+	TargetUUID string
+	Address    string
+	WireTaskID uint
+}
+
+// ReverseTargetResolver 用于将反向探测任务解析为各个受测目标的链路任务列表
+var ReverseTargetResolver func(task models.PingTask) []WireTarget
+
+// TargetResolver 保持向下兼容
+var TargetResolver func(task models.PingTask) string
+
 // executePingTask 执行单个PingTask
 func executePingTask(ctx context.Context, task models.PingTask) {
+	if task.IsReverse {
+		if ReverseTargetResolver != nil && task.ReverseSource != "" {
+			wireTargets := ReverseTargetResolver(task)
+			for _, wt := range wireTargets {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				var message struct {
+					TaskID  uint   `json:"ping_task_id"`
+					Message string `json:"message"`
+					Type    string `json:"ping_type"`
+					Target  string `json:"ping_target"`
+				}
+				message.Message = "ping"
+				message.TaskID = wt.WireTaskID
+				message.Type = task.Type
+				message.Target = wt.Address
+
+				agent_runtime.DispatchPing(task.ReverseSource, message, v2.PingParams{
+					TaskID: wt.WireTaskID,
+					Type:   task.Type,
+					Target: wt.Address,
+				})
+			}
+		}
+		return
+	}
+
+	pingTarget := task.Target
 	var message struct {
 		TaskID  uint   `json:"ping_task_id"`
 		Message string `json:"message"`
@@ -67,7 +112,7 @@ func executePingTask(ctx context.Context, task models.PingTask) {
 	message.Message = "ping"
 	message.TaskID = task.Id
 	message.Type = task.Type
-	message.Target = task.Target
+	message.Target = pingTarget
 
 	for _, clientUUID := range targetPingClientUUIDs(task) {
 		select {
@@ -78,7 +123,7 @@ func executePingTask(ctx context.Context, task models.PingTask) {
 			// Context is still active, continue.
 		}
 
-		agent_runtime.DispatchPing(clientUUID, message, v2.PingParams{TaskID: task.Id, Type: task.Type, Target: task.Target})
+		agent_runtime.DispatchPing(clientUUID, message, v2.PingParams{TaskID: task.Id, Type: task.Type, Target: pingTarget})
 	}
 }
 
