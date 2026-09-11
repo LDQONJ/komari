@@ -80,18 +80,7 @@ func executePingTask(ctx context.Context, task models.PingTask) {
 				default:
 				}
 
-				var message struct {
-					TaskID  uint   `json:"ping_task_id"`
-					Message string `json:"message"`
-					Type    string `json:"ping_type"`
-					Target  string `json:"ping_target"`
-				}
-				message.Message = "ping"
-				message.TaskID = wt.WireTaskID
-				message.Type = task.Type
-				message.Target = wt.Address
-
-				agent_runtime.DispatchPing(task.ReverseSource, message, v2.PingParams{
+				agent_runtime.DispatchPing(task.ReverseSource, v2.PingParams{
 					TaskID: wt.WireTaskID,
 					Type:   task.Type,
 					Target: wt.Address,
@@ -102,18 +91,6 @@ func executePingTask(ctx context.Context, task models.PingTask) {
 	}
 
 	pingTarget := task.Target
-	var message struct {
-		TaskID  uint   `json:"ping_task_id"`
-		Message string `json:"message"`
-		Type    string `json:"ping_type"`
-		Target  string `json:"ping_target"`
-	}
-
-	message.Message = "ping"
-	message.TaskID = task.Id
-	message.Type = task.Type
-	message.Target = pingTarget
-
 	for _, clientUUID := range targetPingClientUUIDs(task) {
 		select {
 		case <-ctx.Done():
@@ -123,7 +100,11 @@ func executePingTask(ctx context.Context, task models.PingTask) {
 			// Context is still active, continue.
 		}
 
-		agent_runtime.DispatchPing(clientUUID, message, v2.PingParams{TaskID: task.Id, Type: task.Type, Target: pingTarget})
+		agent_runtime.DispatchPing(clientUUID, v2.PingParams{
+			TaskID: task.Id,
+			Type:   task.Type,
+			Target: pingTarget,
+		})
 	}
 }
 

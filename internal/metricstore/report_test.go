@@ -2,14 +2,18 @@ package metricstore
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/komari-monitor/komari/database/models"
 	"github.com/komari-monitor/komari/pkg/metric"
-	v1 "github.com/komari-monitor/komari/protocol/v1"
+	v2 "github.com/komari-monitor/komari/protocol/v2"
+	sqlite3 "github.com/mattn/go-sqlite3"
 )
 
 func useReportTestStore(t *testing.T, policy *metric.RollupPolicy) *metric.Store {
@@ -44,6 +48,124 @@ func useReportTestStore(t *testing.T, policy *metric.RollupPolicy) *metric.Store
 	return s
 }
 
+type reportCounterFault struct {
+	remaining atomic.Int32
+	denied    atomic.Int32
+}
+
+func (f *reportCounterFault) denyRollupRead() bool {
+	for {
+		remaining := f.remaining.Load()
+		if remaining <= 0 {
+			return false
+		}
+		if f.remaining.CompareAndSwap(remaining, remaining-1) {
+			f.denied.Add(1)
+			return true
+		}
+	}
+}
+
+type reportSQLiteConnector struct {
+	driver *sqlite3.SQLiteDriver
+	dsn    string
+}
+
+func (c *reportSQLiteConnector) Connect(context.Context) (driver.Conn, error) {
+	return c.driver.Open(c.dsn)
+}
+
+func (c *reportSQLiteConnector) Driver() driver.Driver {
+	return c.driver
+}
+
+// useReportCounterFailureStore denies exactly two rollup reads after schema
+// setup, exercising failed counter restoration while leaving writes usable.
+func useReportCounterFailureStore(t *testing.T) (*metric.Store, *reportCounterFault) {
+	t.Helper()
+	fault := &reportCounterFault{}
+	dsn := fmt.Sprintf("file:report-counter-fault-%d?mode=memory&cache=shared", time.Now().UnixNano())
+	driver := &sqlite3.SQLiteDriver{
+		ConnectHook: func(conn *sqlite3.SQLiteConn) error {
+			conn.RegisterAuthorizer(func(op int, arg1, _, _ string) int {
+				if op == sqlite3.SQLITE_READ && arg1 == "metric_rollups" && fault.denyRollupRead() {
+					return sqlite3.SQLITE_DENY
+				}
+				return sqlite3.SQLITE_OK
+			})
+			return nil
+		},
+	}
+	db := sql.OpenDB(&reportSQLiteConnector{driver: driver, dsn: dsn})
+	s, err := metric.Open(context.Background(), metric.SQLite("", metric.WithDB(db), metric.WithMaxOpenConns(1)))
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("open metric store: %v", err)
+	}
+	if err := createMetricDefinitions(context.Background(), s); err != nil {
+		_ = s.Close()
+		_ = db.Close()
+		t.Fatalf("create metric definitions: %v", err)
+	}
+	fault.remaining.Store(2)
+	storeMu.Lock()
+	previous := store
+	store = s
+	storeMu.Unlock()
+	t.Cleanup(func() {
+		clearReportTrafficStates()
+		storeMu.Lock()
+		store = previous
+		storeMu.Unlock()
+		_ = s.Close()
+		_ = db.Close()
+	})
+	return s, fault
+}
+
+func TestReportBatchCounterRestoreFailureInitializesStateOnce(t *testing.T) {
+	s, fault := useReportCounterFailureStore(t)
+	ctx := context.Background()
+	base := time.Now().UTC().Truncate(time.Second)
+	first := v2.Report{
+		UUID:      "counter-restore-failure",
+		UpdatedAt: base,
+		CPU:       v2.CPUReport{Usage: 10},
+		Network:   v2.NetworkReport{TotalUp: 100, TotalDown: 200},
+	}
+
+	if _, err := writeReportBatch(ctx, []v2.Report{first}); err != nil {
+		t.Fatalf("write first report after counter restore failure: %v", err)
+	}
+	if fault.denied.Load() != 2 {
+		t.Fatalf("counter restore queries = %d, want 2", fault.denied.Load())
+	}
+	stateValue, ok := reportTrafficStates.Load(first.UUID)
+	if !ok {
+		t.Fatal("report traffic state was not persisted")
+	}
+	state := stateValue.(*reportTrafficState)
+	state.mu.Lock()
+	initialized := state.initialized
+	state.mu.Unlock()
+	if !initialized {
+		t.Fatal("report traffic state was not initialized after restore failure")
+	}
+
+	second := first
+	second.UpdatedAt = base.Add(time.Second)
+	second.Network.TotalUp = 150
+	second.Network.TotalDown = 260
+	if _, err := writeReportBatch(ctx, []v2.Report{second}); err != nil {
+		t.Fatalf("write second report: %v", err)
+	}
+	if fault.denied.Load() != 2 {
+		t.Fatalf("counter restore queries after second batch = %d, want no repeat", fault.denied.Load())
+	}
+	assertMetricValues(t, s, MetricTrafficUp, first.UUID, base.Add(-time.Second), base.Add(2*time.Second), []float64{0, 50})
+	assertMetricValues(t, s, MetricTrafficDown, first.UUID, base.Add(-time.Second), base.Add(2*time.Second), []float64{0, 60})
+}
+
 func TestWriteReportStoresMinuteMetricsAndResetAwareTraffic(t *testing.T) {
 	ctx := context.Background()
 	policy := defaultRollupPolicy()
@@ -51,20 +173,20 @@ func TestWriteReportStoresMinuteMetricsAndResetAwareTraffic(t *testing.T) {
 	base := time.Now().UTC().Truncate(time.Minute).Add(5 * time.Second)
 	now := base.Add(45 * time.Second)
 
-	report := v1.Report{
+	report := v2.Report{
 		UUID:        "node-a",
 		UpdatedAt:   base,
-		CPU:         v1.CPUReport{Usage: 12.5},
-		Ram:         v1.RamReport{Used: 100, Total: 1000},
-		Swap:        v1.RamReport{Used: 20, Total: 200},
-		Load:        v1.LoadReport{Load1: 0.5},
-		Disk:        v1.DiskReport{Used: 300, Total: 3000},
-		Network:     v1.NetworkReport{Up: 3, Down: 4, TotalUp: 100, TotalDown: 200},
+		CPU:         v2.CPUReport{Usage: 12.5},
+		Ram:         v2.RamReport{Used: 100, Total: 1000},
+		Swap:        v2.RamReport{Used: 20, Total: 200},
+		Load:        v2.LoadReport{Load1: 0.5},
+		Disk:        v2.DiskReport{Used: 300, Total: 3000},
+		Network:     v2.NetworkReport{Up: 3, Down: 4, TotalUp: 100, TotalDown: 200},
 		Process:     7,
-		Connections: v1.ConnectionsReport{TCP: 8, UDP: 9},
-		GPU: &v1.GPUDetailReport{
+		Connections: v2.ConnectionsReport{TCP: 8, UDP: 9},
+		GPU: &v2.GPUDetailReport{
 			AverageUsage: 25,
-			DetailedInfo: []v1.GPUDeviceInfo{{
+			DetailedInfo: []v2.GPUDeviceInfo{{
 				Name: "GPU 0", MemoryUsed: 400, MemoryTotal: 800, Utilization: 30, Temperature: 55,
 			}},
 		},
@@ -87,11 +209,11 @@ func TestWriteReportStoresMinuteMetricsAndResetAwareTraffic(t *testing.T) {
 		t.Fatalf("write reset report: %v", err)
 	}
 
-	assertMetricValues(t, s, MetricTrafficUp, report.UUID, base.Add(-time.Second), base.Add(time.Minute), []float64{0, 50, 0})
-	assertMetricValues(t, s, MetricTrafficDown, report.UUID, base.Add(-time.Second), base.Add(time.Minute), []float64{0, 60, 0})
+	assertMetricValues(t, s, MetricTrafficUp, report.UUID, base.Add(-time.Second), base.Add(time.Minute), []float64{0, 50, 20})
+	assertMetricValues(t, s, MetricTrafficDown, report.UUID, base.Add(-time.Second), base.Add(time.Minute), []float64{0, 60, 30})
 	assertMetricValues(t, s, MetricNetTotalUp, report.UUID, base.Add(-time.Second), base.Add(time.Minute), []float64{100, 150, 20})
-	assertMetricAggregate(t, s, MetricTrafficUp, report.UUID, base.Add(-time.Second), base.Add(time.Minute), metric.AggSum, 50, 3)
-	assertMetricAggregate(t, s, MetricTrafficDown, report.UUID, base.Add(-time.Second), base.Add(time.Minute), metric.AggSum, 60, 3)
+	assertMetricAggregate(t, s, MetricTrafficUp, report.UUID, base.Add(-time.Second), base.Add(time.Minute), metric.AggSum, 70, 3)
+	assertMetricAggregate(t, s, MetricTrafficDown, report.UUID, base.Add(-time.Second), base.Add(time.Minute), metric.AggSum, 90, 3)
 
 	gpuPoints, err := s.Query(ctx, metric.Query{
 		MetricName: MetricGPUDeviceUsage,
@@ -126,7 +248,7 @@ func TestWriteReportSkipsMetricsWithoutAgentData(t *testing.T) {
 	ctx := context.Background()
 	s := useReportTestStore(t, nil)
 	timestamp := time.Now().UTC()
-	if _, err := WriteReport(ctx, v1.Report{
+	if _, err := WriteReport(ctx, v2.Report{
 		UUID: "node-without-gpu", UpdatedAt: timestamp,
 	}); err != nil {
 		t.Fatalf("write report: %v", err)
@@ -154,11 +276,11 @@ func TestReportBatcherFlushesQueuedReports(t *testing.T) {
 	})
 
 	base := time.Now().UTC().Truncate(time.Minute).Add(10 * time.Second)
-	first := v1.Report{
+	first := v2.Report{
 		UUID:      "batched-node",
 		UpdatedAt: base,
-		CPU:       v1.CPUReport{Usage: 10},
-		Network:   v1.NetworkReport{TotalUp: 100, TotalDown: 200},
+		CPU:       v2.CPUReport{Usage: 10},
+		Network:   v2.NetworkReport{TotalUp: 100, TotalDown: 200},
 	}
 	second := first
 	second.UpdatedAt = base.Add(3 * time.Second)
@@ -271,11 +393,11 @@ func TestReportBatchKeepsEverySample(t *testing.T) {
 	ctx := context.Background()
 	s := useReportTestStore(t, nil)
 	base := time.Now().UTC().Truncate(time.Second)
-	pending := []v1.Report{
-		{UUID: "node-a", UpdatedAt: base, CPU: v1.CPUReport{Usage: 10}, Network: v1.NetworkReport{TotalUp: 100}},
-		{UUID: "node-a", UpdatedAt: base, CPU: v1.CPUReport{Usage: 20}, Network: v1.NetworkReport{TotalUp: 150}},
-		{UUID: "node-b", UpdatedAt: base, CPU: v1.CPUReport{Usage: 30}, Network: v1.NetworkReport{TotalUp: 200}},
-		{UUID: "node-b", UpdatedAt: base.Add(time.Second), CPU: v1.CPUReport{Usage: 40}, Network: v1.NetworkReport{TotalUp: 260}},
+	pending := []v2.Report{
+		{UUID: "node-a", UpdatedAt: base, CPU: v2.CPUReport{Usage: 10}, Network: v2.NetworkReport{TotalUp: 100}},
+		{UUID: "node-a", UpdatedAt: base, CPU: v2.CPUReport{Usage: 20}, Network: v2.NetworkReport{TotalUp: 150}},
+		{UUID: "node-b", UpdatedAt: base, CPU: v2.CPUReport{Usage: 30}, Network: v2.NetworkReport{TotalUp: 200}},
+		{UUID: "node-b", UpdatedAt: base.Add(time.Second), CPU: v2.CPUReport{Usage: 40}, Network: v2.NetworkReport{TotalUp: 260}},
 	}
 
 	if err := writePendingReports(ctx, &pending); err != nil {
@@ -292,11 +414,11 @@ func TestReportQueueFullReturnsError(t *testing.T) {
 	ctx := context.Background()
 	useReportTestStore(t, nil)
 	worker := &reportBatchWorker{
-		queue:    make(chan v1.Report, 1),
+		queue:    make(chan v2.Report, 1),
 		requests: make(chan reportBatchRequest, 1),
 		done:     make(chan struct{}),
 	}
-	worker.queue <- v1.Report{UUID: "already-queued"}
+	worker.queue <- v2.Report{UUID: "already-queued"}
 	reportBatcherMu.Lock()
 	reportBatcher = worker
 	reportBatcherMu.Unlock()
@@ -308,7 +430,7 @@ func TestReportQueueFullReturnsError(t *testing.T) {
 		reportBatcherMu.Unlock()
 	})
 
-	report := v1.Report{
+	report := v2.Report{
 		UUID:      "realtime-node",
 		UpdatedAt: time.Now().UTC(),
 	}
@@ -348,6 +470,10 @@ func TestRecordReconstructionUsesMetricSpecificAggregation(t *testing.T) {
 }
 
 func TestTrafficCounterDelta(t *testing.T) {
+	const (
+		oneGB = int64(1_000_000_000)
+		oneTB = int64(1_000_000_000_000)
+	)
 	tests := []struct {
 		name     string
 		current  int64
@@ -360,6 +486,11 @@ func TestTrafficCounterDelta(t *testing.T) {
 		{name: "counter reset", current: 15, previous: 250, want: 15},
 		{name: "negative current", current: -1, previous: 100, want: 0},
 		{name: "negative previous", current: 15, previous: -1, want: 0},
+		{name: "tb-scale monotonic", current: 2*oneTB + 5*oneGB, previous: 2 * oneTB, want: 5 * oneGB},
+		{name: "32-bit wrap leftover", current: 800_000_000, previous: 3*oneGB + 900_000_000, want: 800_000_000},
+		{name: "reboot leftover below cap", current: 8 * oneGB, previous: 2 * oneTB, want: 8 * oneGB},
+		{name: "tb-scale tiny dip", current: 2*oneTB - 100, previous: 2 * oneTB, want: 0},
+		{name: "tb-scale false reset", current: 2*oneTB + 5*oneGB - 1000, previous: 2*oneTB + 5*oneGB, want: 0},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -374,11 +505,11 @@ func TestWriteReportRebasesTrafficAfterAgentRestart(t *testing.T) {
 	ctx := context.Background()
 	s := useReportTestStore(t, nil)
 	base := time.Now().UTC().Truncate(time.Minute).Add(5 * time.Second)
-	report := v1.Report{
+	report := v2.Report{
 		UUID:      "restarted-node",
 		UpdatedAt: base,
 		Uptime:    1000,
-		Network:   v1.NetworkReport{TotalUp: 100, TotalDown: 200},
+		Network:   v2.NetworkReport{TotalUp: 100, TotalDown: 200},
 	}
 	if _, err := WriteReport(ctx, report); err != nil {
 		t.Fatalf("write first report: %v", err)
@@ -408,8 +539,161 @@ func TestWriteReportRebasesTrafficAfterAgentRestart(t *testing.T) {
 		t.Fatalf("write report after new baseline: %v", err)
 	}
 
-	assertMetricValues(t, s, MetricTrafficUp, report.UUID, base.Add(-time.Second), base.Add(time.Minute), []float64{0, 50, 0, 25})
-	assertMetricValues(t, s, MetricTrafficDown, report.UUID, base.Add(-time.Second), base.Add(time.Minute), []float64{0, 60, 0, 35})
+	assertMetricValues(t, s, MetricTrafficUp, report.UUID, base.Add(-time.Second), base.Add(time.Minute), []float64{0, 50, 5, 25})
+	assertMetricValues(t, s, MetricTrafficDown, report.UUID, base.Add(-time.Second), base.Add(time.Minute), []float64{0, 60, 5, 35})
+}
+
+func TestWriteReportCountsTBScaleTrafficDeltas(t *testing.T) {
+	const (
+		oneGB = int64(1_000_000_000)
+		oneTB = int64(1_000_000_000_000)
+	)
+	ctx := context.Background()
+	s := useReportTestStore(t, nil)
+	base := time.Now().UTC().Truncate(time.Minute).Add(5 * time.Second)
+	report := v2.Report{
+		UUID:      "tb-node",
+		UpdatedAt: base,
+		Uptime:    10_000,
+		Network:   v2.NetworkReport{TotalUp: 2 * oneTB, TotalDown: 3 * oneTB},
+	}
+	if _, err := WriteReport(ctx, report); err != nil {
+		t.Fatalf("write first report: %v", err)
+	}
+
+	report.UpdatedAt = base.Add(3 * time.Second)
+	report.Uptime = 10_003
+	report.Network.TotalUp = 2*oneTB + 5*oneGB
+	report.Network.TotalDown = 3*oneTB + 7*oneGB
+	if _, err := WriteReport(ctx, report); err != nil {
+		t.Fatalf("write growing report: %v", err)
+	}
+
+	assertMetricValues(t, s, MetricTrafficUp, report.UUID, base.Add(-time.Second), base.Add(time.Minute), []float64{0, float64(5 * oneGB)})
+	assertMetricValues(t, s, MetricTrafficDown, report.UUID, base.Add(-time.Second), base.Add(time.Minute), []float64{0, float64(7 * oneGB)})
+}
+
+func TestWriteReportRestoresTBScaleCountersFromStore(t *testing.T) {
+	const (
+		oneGB = int64(1_000_000_000)
+		oneTB = int64(1_000_000_000_000)
+	)
+	ctx := context.Background()
+	policy := defaultRollupPolicy()
+	s := useReportTestStore(t, &policy)
+	base := time.Now().UTC().Truncate(time.Minute).Add(5 * time.Second)
+	now := base.Add(45 * time.Second)
+	report := v2.Report{
+		UUID:      "tb-restore-node",
+		UpdatedAt: base,
+		Uptime:    10_000,
+		Network:   v2.NetworkReport{TotalUp: 2*oneTB + 123, TotalDown: 4*oneTB + 456},
+	}
+	if _, err := WriteReport(ctx, report); err != nil {
+		t.Fatalf("write first report: %v", err)
+	}
+
+	restoredUp, hasUp, err := latestReportCounter(ctx, s, MetricNetTotalUp, report.UUID, now)
+	if err != nil {
+		t.Fatalf("restore upload counter: %v", err)
+	}
+	if !hasUp || restoredUp != report.Network.TotalUp {
+		t.Fatalf("restored upload counter = %d (has=%v), want %d", restoredUp, hasUp, report.Network.TotalUp)
+	}
+	restoredDown, hasDown, err := latestReportCounter(ctx, s, MetricNetTotalDown, report.UUID, now)
+	if err != nil {
+		t.Fatalf("restore download counter: %v", err)
+	}
+	if !hasDown || restoredDown != report.Network.TotalDown {
+		t.Fatalf("restored download counter = %d (has=%v), want %d", restoredDown, hasDown, report.Network.TotalDown)
+	}
+
+	if _, err := s.Compact(ctx, now); err != nil {
+		t.Fatalf("compact reports: %v", err)
+	}
+	deleteReportTrafficState(report.UUID)
+	report.UpdatedAt = now
+	report.Uptime = 10_045
+	report.Network.TotalUp = 2*oneTB + 123 + 5*oneGB
+	report.Network.TotalDown = 4*oneTB + 456 + 7*oneGB
+	if _, err := WriteReport(ctx, report); err != nil {
+		t.Fatalf("write after restoring tb-scale baseline: %v", err)
+	}
+	assertMetricValues(t, s, MetricTrafficUp, report.UUID, now.Add(-time.Second), now.Add(time.Second), []float64{float64(5 * oneGB)})
+	assertMetricValues(t, s, MetricTrafficDown, report.UUID, now.Add(-time.Second), now.Add(time.Second), []float64{float64(7 * oneGB)})
+}
+
+func TestWriteReportCountsTrafficAfterHighRateCounterWrap(t *testing.T) {
+	const oneGB = int64(1_000_000_000)
+	ctx := context.Background()
+	s := useReportTestStore(t, nil)
+	base := time.Now().UTC().Truncate(time.Minute).Add(5 * time.Second)
+	report := v2.Report{
+		UUID:      "wrap-node",
+		UpdatedAt: base,
+		Uptime:    10_000,
+		Network:   v2.NetworkReport{TotalUp: 3*oneGB + 900_000_000, TotalDown: 3*oneGB + 800_000_000},
+	}
+	if _, err := WriteReport(ctx, report); err != nil {
+		t.Fatalf("write first report: %v", err)
+	}
+
+	report.UpdatedAt = base.Add(3 * time.Second)
+	report.Uptime = 10_003
+	report.Network.TotalUp = 800_000_000
+	report.Network.TotalDown = 900_000_000
+	if _, err := WriteReport(ctx, report); err != nil {
+		t.Fatalf("write wrapped report: %v", err)
+	}
+
+	assertMetricValues(t, s, MetricTrafficUp, report.UUID, base.Add(-time.Second), base.Add(time.Minute), []float64{0, 800_000_000})
+	assertMetricValues(t, s, MetricTrafficDown, report.UUID, base.Add(-time.Second), base.Add(time.Minute), []float64{0, 900_000_000})
+}
+
+func TestWriteReportIgnoresTinyDipOfTBScaleCounter(t *testing.T) {
+	const (
+		oneGB = int64(1_000_000_000)
+		oneTB = int64(1_000_000_000_000)
+	)
+	ctx := context.Background()
+	s := useReportTestStore(t, nil)
+	base := time.Now().UTC().Truncate(time.Minute).Add(5 * time.Second)
+	report := v2.Report{
+		UUID:      "tb-jitter-node",
+		UpdatedAt: base,
+		Uptime:    10_000,
+		Network:   v2.NetworkReport{TotalUp: 2 * oneTB, TotalDown: 3 * oneTB},
+	}
+	if _, err := WriteReport(ctx, report); err != nil {
+		t.Fatalf("write first report: %v", err)
+	}
+
+	report.UpdatedAt = base.Add(3 * time.Second)
+	report.Uptime = 10_003
+	report.Network.TotalUp = 2*oneTB + 5*oneGB
+	report.Network.TotalDown = 3*oneTB + 7*oneGB
+	if _, err := WriteReport(ctx, report); err != nil {
+		t.Fatalf("write growing report: %v", err)
+	}
+
+	report.UpdatedAt = base.Add(6 * time.Second)
+	report.Uptime = 10_006
+	report.Network.TotalUp = 2*oneTB + 5*oneGB - 1000
+	report.Network.TotalDown = 3*oneTB + 7*oneGB - 2000
+	if _, err := WriteReport(ctx, report); err != nil {
+		t.Fatalf("write jitter report: %v", err)
+	}
+
+	report.UpdatedAt = base.Add(9 * time.Second)
+	report.Uptime = 10_009
+	report.Network.TotalUp = 2*oneTB + 6*oneGB
+	report.Network.TotalDown = 3*oneTB + 8*oneGB
+	if _, err := WriteReport(ctx, report); err != nil {
+		t.Fatalf("write recovered report: %v", err)
+	}
+
+	assertMetricValues(t, s, MetricTrafficUp, report.UUID, base.Add(-time.Second), base.Add(time.Minute), []float64{0, float64(5 * oneGB), 0, float64(oneGB + 1000)})
+	assertMetricValues(t, s, MetricTrafficDown, report.UUID, base.Add(-time.Second), base.Add(time.Minute), []float64{0, float64(7 * oneGB), 0, float64(oneGB + 2000)})
 }
 
 func TestWriteReportNormalizesReceiveTimeToUTC(t *testing.T) {
@@ -417,11 +701,11 @@ func TestWriteReportNormalizesReceiveTimeToUTC(t *testing.T) {
 	s := useReportTestStore(t, nil)
 	local := time.FixedZone("UTC+8", 8*60*60)
 	receiveTime := time.Now().In(local).Add(-10 * time.Second)
-	report := v1.Report{
+	report := v2.Report{
 		UUID:      "utc-report",
 		UpdatedAt: receiveTime,
-		CPU:       v1.CPUReport{Usage: 10},
-		Network:   v1.NetworkReport{TotalUp: 1, TotalDown: 2},
+		CPU:       v2.CPUReport{Usage: 10},
+		Network:   v2.NetworkReport{TotalUp: 1, TotalDown: 2},
 	}
 
 	saved, err := WriteReport(ctx, report)
