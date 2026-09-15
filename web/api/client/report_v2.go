@@ -175,6 +175,13 @@ func WebSocketV2RPC(c *gin.Context) {
 		return
 	}
 
+	if rawConn := conn.GetConn(); rawConn != nil {
+		rawConn.SetPingHandler(func(appData string) error {
+			conn.SetReadDeadline(time.Now().Add(readWait))
+			return rawConn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(10*time.Second))
+		})
+	}
+
 	for {
 		conn.SetReadDeadline(time.Now().Add(readWait))
 		_, message, err := conn.ReadMessage()
