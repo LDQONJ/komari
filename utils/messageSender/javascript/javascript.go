@@ -1,30 +1,80 @@
 package javascript
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"time"
 
-	"github.com/komari-monitor/komari/database/models"
 	"github.com/komari-monitor/komari/pkg/jsruntime"
-	"github.com/komari-monitor/komari/utils/messageSender/factory"
+	"github.com/komari-monitor/komari/utils/messageSender"
+	"github.com/komari-monitor/komari/utils/messageSender/outboundhttp"
 )
 
+// DataDir confines notification scripts' filesystem and local module access.
+var DataDir = "./data/notification/javascript"
+
+// ChannelID is also the key of existing JavaScript configurations in the database.
+const ChannelID = "Javascript"
+
+const executionTimeout = 30 * time.Second
+
 type JavaScriptSender struct {
-	Addition
+	mu      sync.Mutex
+	script  string
 	runtime *jsruntime.Runtime
 }
 
-func (j *JavaScriptSender) GetName() string {
-	return "Javascript"
+func (j *JavaScriptSender) Send(ctx context.Context, notification messageSender.Notification, config map[string]any) error {
+	var addition Addition
+	if err := messageSender.DecodeConfiguration(config, &addition); err != nil {
+		return err
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := j.ensureRuntime(addition.Script); err != nil {
+		return err
+	}
+	if !j.runtime.HasFunction("sendEvent") {
+		return j.runtime.Call("sendMessage", notification.Message, notification.Title)
+	}
+
+	// Preserve the event's JSON field names and nested payloads for legacy scripts.
+	raw, err := json.Marshal(notification.Event)
+	if err != nil {
+		return fmt.Errorf("marshal notification event: %w", err)
+	}
+	var event map[string]any
+	if err := json.Unmarshal(raw, &event); err != nil {
+		return fmt.Errorf("decode notification event: %w", err)
+	}
+	return j.runtime.Call("sendEvent", event)
 }
 
-func (j *JavaScriptSender) GetConfiguration() factory.Configuration {
-	return &j.Addition
-}
-
-func (j *JavaScriptSender) Init() error {
-	runtime, err := jsruntime.New(j.Addition.Script, jsruntime.Options{})
+func (j *JavaScriptSender) ensureRuntime(script string) error {
+	if j.runtime != nil && j.script == script {
+		return nil
+	}
+	j.closeRuntime()
+	if strings.TrimSpace(script) == "" {
+		return errors.New("JavaScript notification script is not configured")
+	}
+	if err := os.MkdirAll(DataDir, 0755); err != nil {
+		return fmt.Errorf("create JavaScript notification directory: %w", err)
+	}
+	runtime, err := jsruntime.New(script, jsruntime.Options{
+		BaseDir:    DataDir,
+		NodeJS:     true,
+		Timeout:    executionTimeout,
+		HTTPClient: outboundhttp.NewClient(executionTimeout),
+	})
 	if err != nil {
 		return err
 	}
@@ -32,85 +82,28 @@ func (j *JavaScriptSender) Init() error {
 		runtime.Close()
 		return errors.New("sendMessage function not defined or not callable in script")
 	}
-	if j.runtime != nil {
-		j.runtime.Close()
-	}
+	j.script = script
 	j.runtime = runtime
 	return nil
 }
 
-func (j *JavaScriptSender) Destroy() error {
+func (j *JavaScriptSender) closeRuntime() {
 	if j.runtime != nil {
 		j.runtime.Close()
 		j.runtime = nil
 	}
+	j.script = ""
+}
+
+func (j *JavaScriptSender) Unload() error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.closeRuntime()
 	return nil
 }
 
-func (j *JavaScriptSender) SendTextMessage(message, title string) error {
-	if err := j.ensureRuntime(); err != nil {
-		return err
-	}
-	return j.runtime.Call("sendMessage", message, title)
+func Register() error {
+	return messageSender.RegisterNotificationChannel(ChannelID, messageSender.ManagedConfiguration("JavaScript", Addition{}), &JavaScriptSender{})
 }
 
-func (j *JavaScriptSender) SendEvent(event models.EventMessage) error {
-	if err := j.ensureRuntime(); err != nil {
-		return err
-	}
-	if !j.runtime.HasFunction("sendEvent") {
-		return j.fallbackToTextMessage(event)
-	}
-
-	eventJSON, err := json.Marshal(event)
-	if err != nil {
-		return fmt.Errorf("failed to marshal event: %v", err)
-	}
-	var eventMap map[string]interface{}
-	if err := json.Unmarshal(eventJSON, &eventMap); err != nil {
-		return fmt.Errorf("failed to unmarshal event: %v", err)
-	}
-	return j.runtime.Call("sendEvent", eventMap)
-}
-
-func (j *JavaScriptSender) ensureRuntime() error {
-	if j.runtime != nil {
-		return nil
-	}
-	return j.Init()
-}
-
-// fallbackToTextMessage formats structured events for scripts that only
-// implement sendMessage.
-func (j *JavaScriptSender) fallbackToTextMessage(event models.EventMessage) error {
-	message := fmt.Sprintf("%v%v%v\nEvent: %v\nMessage: %v\nTime: %s",
-		event.Emoji, event.Emoji, event.Emoji,
-		event.Event,
-		event.Message,
-		event.Time.UTC().Format("2006-01-02 15:04:05"))
-	if len(event.Clients) > 0 {
-		clientNames := make([]string, 0, len(event.Clients))
-		for _, client := range event.Clients {
-			name := client.Name
-			if name == "" {
-				name = client.UUID
-			}
-			clientNames = append(clientNames, name)
-		}
-		message = fmt.Sprintf("%v%v%v\nEvent: %v\nClients: %s\nMessage: %v\nTime: %s",
-			event.Emoji, event.Emoji, event.Emoji,
-			event.Event,
-			clientNames,
-			event.Message,
-			event.Time.UTC().Format("2006-01-02 15:04:05"))
-	}
-	return j.SendTextMessage(message, fmt.Sprint(event.Event))
-}
-
-func init() {
-	factory.RegisterMessageSender(func() factory.IMessageSender {
-		return &JavaScriptSender{}
-	})
-}
-
-var _ factory.IMessageSender = (*JavaScriptSender)(nil)
+var _ messageSender.NotificationChannel = (*JavaScriptSender)(nil)

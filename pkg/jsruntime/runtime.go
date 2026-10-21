@@ -22,7 +22,6 @@ import (
 	_ "github.com/dop251/goja_nodejs/buffer"
 	"github.com/dop251/goja_nodejs/eventloop"
 	"github.com/dop251/goja_nodejs/require"
-	_ "github.com/dop251/goja_nodejs/url"
 	_ "github.com/dop251/goja_nodejs/util"
 	childprocess "github.com/komari-monitor/komari/pkg/jsruntime/child_process"
 	"github.com/komari-monitor/komari/pkg/jsruntime/console"
@@ -35,6 +34,7 @@ import (
 	pathmodule "github.com/komari-monitor/komari/pkg/jsruntime/path"
 	processmodule "github.com/komari-monitor/komari/pkg/jsruntime/process"
 	"github.com/komari-monitor/komari/pkg/jsruntime/timers"
+	tlsmodule "github.com/komari-monitor/komari/pkg/jsruntime/tls"
 )
 
 const defaultTimeout = 30 * time.Second
@@ -123,6 +123,7 @@ type Runtime struct {
 	processModule       *processmodule.Module
 	childProcessModule  *childprocess.Module
 	netModule           *netmodule.Module
+	tlsModule           *tlsmodule.Module
 	httpModule          *httpmodule.Module
 	cryptoModule        *cryptomodule.Module
 	resourceMu          sync.Mutex
@@ -237,6 +238,7 @@ func New(script string, options Options) (*Runtime, error) {
 		})
 		runtime.childProcessModule = childprocess.New(host, filesystem, options.AllowExec, maxChildOutputBytes)
 		runtime.netModule = netmodule.New(host, options.AllowListen)
+		runtime.tlsModule = tlsmodule.New(host, runtime.netModule)
 		runtime.httpModule = httpmodule.New(host, options.AllowListen, maxHTTPBodyBytes)
 		runtime.cryptoModule = cryptomodule.New(host)
 		runtime.registerNodeModules(registry)
@@ -412,9 +414,6 @@ func pathWithinBaseDir(baseDir, path string) bool {
 // Close stops the event loop and cancels its pending timers. A closed runtime
 // cannot be called again.
 func (r *Runtime) Close() {
-	if r == nil {
-		return
-	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
@@ -441,9 +440,6 @@ func (r *Runtime) closeHostResources() {
 // HasFunction reports whether name resolves to a callable JavaScript
 // function.
 func (r *Runtime) HasFunction(name string) bool {
-	if r == nil {
-		return false
-	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
@@ -479,10 +475,6 @@ func (r *Runtime) CallVoid(name string, args ...any) error {
 }
 
 func (r *Runtime) call(name string, requireTruthy bool, args ...any) error {
-	if r == nil {
-		return errors.New("JavaScript runtime is nil")
-	}
-
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {

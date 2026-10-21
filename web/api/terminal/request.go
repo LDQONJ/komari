@@ -55,7 +55,7 @@ func RequestTerminal(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "Require WebSocket upgrade"})
 		return
 	}
-	conn, err := api.UpgradeSafeConn(c)
+	conn, err := api.UpgradeSafeConn(c, api.EnableWebSocketCompression)
 	if err != nil {
 		return
 	}
@@ -111,5 +111,4 @@ func RequestTerminal(c *gin.Context) {
 		return
 	}
 	conn.WriteMessage(1, []byte("等待被控端连接 waiting for agent...\n"))
-	//auditlog.Log(c.ClientIP(), userID, "request, terminal id:"+id+",client:"+session.UUID, "terminal")
 }

@@ -9,9 +9,7 @@ import (
 )
 
 const (
-	// 如果超过这个时间没有收到任何消息，则认为连接已死
-	readWait        = 60 * time.Second
-	postPresenceTTL = 90 * time.Second
+	postPresenceTTL = 35 * time.Second
 )
 
 type postPresenceEntry struct {
@@ -46,10 +44,9 @@ func refreshPostPresence(uuid string) {
 	agent_runtime.MarkV2Client(uuid)
 	go notifier.OnlineNotification(uuid, connID)
 
-	defaultGeneration := uint64(0)
-	entry := &postPresenceEntry{connID: connID, generation: defaultGeneration}
+	entry := &postPresenceEntry{connID: connID}
 	entry.timer = time.AfterFunc(postPresenceTTL, func() {
-		postPresenceExpired(uuid, connID, defaultGeneration)
+		postPresenceExpired(uuid, connID, 0)
 	})
 	postPresenceStates[uuid] = entry
 }
