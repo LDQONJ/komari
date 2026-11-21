@@ -1,8 +1,18 @@
 name: Attach Release Binaries
 
 on:
+  push:
+    tags:
+      - "[0-9]*.[0-9]*.[0-9]*"
+      - "v[0-9]*"
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and publish (defaults to ref name)"
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -14,19 +24,33 @@ env:
 
 jobs:
   resolve-release:
+    if: ${{ github.event_name != 'release' || !github.event.release.prerelease }}
     runs-on: ubuntu-latest
     outputs:
+      tag: ${{ steps.release.outputs.tag }}
       frontend_ref: ${{ steps.release.outputs.frontend_ref }}
 
     steps:
       - id: release
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
+          set -eu
+          if [ "$EVENT_NAME" = "release" ]; then
+            TAG="$RELEASE_TAG"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="$REF_NAME"
+          fi
           frontend_ref=""
           if [[ "$TAG" =~ ^(.+)-fix[0-9]+$ ]]; then
             frontend_ref="${BASH_REMATCH[1]}"
           fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "frontend_ref=$frontend_ref" >> "$GITHUB_OUTPUT"
 
   build-frontend:
@@ -102,7 +126,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version-file: go.mod
 
       - name: Install Zig cross-compiler toolchain
         uses: ./.github/actions/setup-zig
@@ -119,7 +143,7 @@ jobs:
           if [ "${{ matrix.binary_extension }}" != "" ]; then
             BINARY_NAME=${BINARY_NAME}${{ matrix.binary_extension }}
           fi
-          VERSION="${{ github.event.release.tag_name }}"
+          VERSION="${{ needs.resolve-release.outputs.tag }}"
           VERSION_HASH="${{ github.sha }}" # Use commit SHA for hash
           LDFLAGS="-s -w -X github.com/komari-monitor/komari/utils.CurrentVersion=${VERSION} -X github.com/komari-monitor/komari/utils.VersionHash=${VERSION_HASH}"
           if [ "${{ matrix.goos }}" = "linux" ]; then
@@ -133,21 +157,37 @@ jobs:
           name: komari-${{ matrix.goos }}-${{ matrix.goarch }}
           path: komari-${{ matrix.goos }}-${{ matrix.goarch }}*
 
-      - name: Upload binary to release
+  publish-release:
+    needs: [resolve-release, build-and-attach-binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Linux binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: komari-linux-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download Windows binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: komari-windows-*
+          path: dist
+          merge-multiple: true
+
+      - name: Ensure Release and Upload Binaries
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve-release.outputs.tag }}
         run: |
-          # Define the binary name for upload
-          BINARY_NAME=komari-${{ matrix.goos }}-${{ matrix.goarch }}
-          if [ "${{ matrix.goos }}" = "windows" ]; then
-            BINARY_NAME=${BINARY_NAME}.exe
+          set -eu
+          if ! gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "${{ github.repository }}" --title "$TAG" --generate-notes --target "$GITHUB_SHA"
           fi
-          # Upload the binary as a release asset using GitHub CLI
-          gh release upload ${{ github.event.release.tag_name }} $BINARY_NAME --repo ${{ github.repository }}
-        shell: bash
+          gh release upload "$TAG" dist/komari-* --repo "${{ github.repository }}" --clobber
 
   build-and-push-docker:
-    needs: build-and-attach-binaries
+    needs: [resolve-release, publish-release]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -181,7 +221,7 @@ jobs:
         id: release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ needs.resolve-release.outputs.tag }}
         run: |
           is_latest="$(gh api graphql \
             -f 'query=query($owner: String!, $name: String!, $tag: String!) { repository(owner: $owner, name: $name) { release(tagName: $tag) { isLatest } } }' \
@@ -197,7 +237,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=${{ github.event.release.tag_name }}
+            type=raw,value=${{ needs.resolve-release.outputs.tag }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
@@ -213,5 +253,5 @@ jobs:
       - name: Promote Docker latest tag
         if: steps.release.outputs.is_latest == 'true'
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ needs.resolve-release.outputs.tag }}
         run: docker buildx imagetools create --tag "${REGISTRY}/${IMAGE_NAME}:latest" "${REGISTRY}/${IMAGE_NAME}:${TAG}"
