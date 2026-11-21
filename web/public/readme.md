@@ -4,7 +4,7 @@
 
 ### Frontend Repository
 
-- **Frontend project repository**: https://github.com/komari-monitor/komari-web
+- **Frontend project repository**: https://github.com/LDQONJ/komari-web
 
 ### Build Requirements
 
@@ -23,7 +23,7 @@
 
 ### 前端项目仓库
 
-- **前端项目地址**: https://github.com/komari-monitor/komari-web
+- **前端项目地址**: https://github.com/LDQONJ/komari-web
 
 ### 构建要求
 
@@ -42,7 +42,7 @@
 
 ### フロントエンドプロジェクトリポジトリ
 
-- **フロントエンドプロジェクトアドレス**: https://github.com/komari-monitor/komari-web
+- **フロントエンドプロジェクトアドレス**: https://github.com/LDQONJ/komari-web
 
 ### ビルド要件
 
@@ -61,7 +61,7 @@
 
 ```bash
 # Clone frontend repository / 克隆前端仓库 / フロントエンドリポジトリをクローン
-git clone https://github.com/komari-monitor/komari-web
+git clone https://github.com/LDQONJ/komari-web
 cd komari-web
 
 # Install dependencies and build / 安装依赖并构建 / 依存関係をインストールしてビルド
