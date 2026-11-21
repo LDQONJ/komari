@@ -254,4 +254,6 @@ jobs:
         if: steps.release.outputs.is_latest == 'true'
         env:
           TAG: ${{ needs.resolve-release.outputs.tag }}
-        run: docker buildx imagetools create --tag "${REGISTRY}/${IMAGE_NAME}:latest" "${REGISTRY}/${IMAGE_NAME}:${TAG}"
+        run: |
+          IMAGE_LOWER="${IMAGE_NAME,,}"
+          docker buildx imagetools create --tag "${REGISTRY}/${IMAGE_LOWER}:latest" "${REGISTRY}/${IMAGE_LOWER}:${TAG}"
