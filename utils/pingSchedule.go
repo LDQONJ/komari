@@ -3,6 +3,7 @@ package utils
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -70,6 +71,28 @@ var TargetResolver func(task models.PingTask) string
 
 // executePingTask 执行单个PingTask
 func executePingTask(ctx context.Context, task models.PingTask) {
+	// 随机延时调度（Jitter）：打散并发任务下发时机，避免瞬时并发冲垮网络设备、NAT 会话与网卡队列
+	maxJitterMs := 2000
+	if task.Interval > 0 && task.Interval*100 < maxJitterMs {
+		maxJitterMs = task.Interval * 100
+	}
+
+	dispatchWithJitter := func(clientUUID string, params v2.PingParams) {
+		if maxJitterMs <= 0 {
+			agent_runtime.DispatchPing(clientUUID, params)
+			return
+		}
+		jitter := time.Duration(rand.IntN(maxJitterMs)) * time.Millisecond
+		go func() {
+			select {
+			case <-time.After(jitter):
+			case <-ctx.Done():
+				return
+			}
+			agent_runtime.DispatchPing(clientUUID, params)
+		}()
+	}
+
 	if task.IsReverse {
 		if ReverseTargetResolver != nil && task.ReverseSource != "" {
 			wireTargets := ReverseTargetResolver(task)
@@ -80,7 +103,7 @@ func executePingTask(ctx context.Context, task models.PingTask) {
 				default:
 				}
 
-				agent_runtime.DispatchPing(task.ReverseSource, v2.PingParams{
+				dispatchWithJitter(task.ReverseSource, v2.PingParams{
 					TaskID: wt.WireTaskID,
 					Type:   task.Type,
 					Target: wt.Address,
@@ -100,7 +123,7 @@ func executePingTask(ctx context.Context, task models.PingTask) {
 			// Context is still active, continue.
 		}
 
-		agent_runtime.DispatchPing(clientUUID, v2.PingParams{
+		dispatchWithJitter(clientUUID, v2.PingParams{
 			TaskID: task.Id,
 			Type:   task.Type,
 			Target: pingTarget,
